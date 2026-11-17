@@ -196,6 +196,15 @@ Beep.Voice.prototype.setup = function(){
 	this.isPlaying = false
 
 
+	//  When sustainDuration is finite we schedule an automatic
+	//  pause() via setTimeout. We must track that timer’s ID so a
+	//  re-play() or teardown() can cancel it -- otherwise a stale
+	//  timer from a *previous* play() will fire later and ramp the
+	//  *new* sound down to silence!
+
+	this.sustainTimeoutID = null
+
+
 	//  Create an Oscillator
 	//  for generating the sound.
 
@@ -224,16 +233,29 @@ Beep.Voice.prototype.setup = function(){
 
 Beep.Voice.prototype.play = function( velocity ){
 
-	var 
+	var
 	that    = this,
 	timeNow = this.audioContext.currentTime,
 	gainNow = this.gainNode.gain.value
+
+
+	//  A torn-down Voice has a stopped, disconnected oscillator
+	//  and oscillators are NOT reusable. Don’t try to revive it.
+
+	if( this.isTorndown ) return this
 
 
 	//  Optionally accept a velocity (expecting a value 0 through 1)
 	//  to be multiplied against the attack and sustain gains.
 
 	if( typeof velocity !== 'number' ) velocity = 0.5
+
+
+	//  Cancel any pending auto-pause from a previous play() call.
+	//  Without this a rapid play → pause → play sequence leaves the
+	//  OLD release timer alive, and it will mute THIS new envelope.
+
+	this.clearSustainTimeout()
 
 
 	//  Just in case we’ve changed the value of Note
@@ -287,15 +309,37 @@ Beep.Voice.prototype.play = function( velocity ){
 	}
 
 
-	//  Did we set a duration limit on this	Voice?
+	//  Did we set a duration limit on this Voice?
+	//  NB: setTimeout() expects milliseconds while our durations
+	//  are in seconds -- and currentTime must NOT be added here
+	//  because setTimeout delays are relative, not absolute!
 
-	if( this.sustainDuration !== Infinity ) setTimeout( function(){
+	if( this.sustainDuration !== Infinity ){
 
-		that.pause()
+		this.sustainTimeoutID = setTimeout( function(){
 
-	}, timeNow + this.delayDuration + this.attackDuration + this.sustainDuration * 1000 )
+			that.sustainTimeoutID = null
+			that.pause()
+
+		}, ( this.delayDuration + this.attackDuration + this.sustainDuration ) * 1000 )
+	}
 
 
+	return this
+}
+
+
+//  Cancel the pending auto-pause timer, if any.
+//  Shared by play(), pause(), and teardown() so a stale release
+//  can never ambush a fresh envelope.
+
+Beep.Voice.prototype.clearSustainTimeout = function(){
+
+	if( this.sustainTimeoutID !== null ){
+
+		clearTimeout( this.sustainTimeoutID )
+		this.sustainTimeoutID = null
+	}
 	return this
 }
 
@@ -309,6 +353,14 @@ Beep.Voice.prototype.pause = function(){
 	var timeNow = this.audioContext.currentTime
 
 
+	if( this.isTorndown ) return this
+
+
+	//  A manual pause() supersedes any scheduled auto-pause;
+	//  otherwise the pending timer would schedule a SECOND
+	//  release envelope on top of this one.
+
+	this.clearSustainTimeout()
 	//  Cancel all your plans.
 	//  And let’s tween from the current gain value.
 
@@ -333,6 +385,24 @@ Beep.Voice.prototype.teardown = function(){
 
 	if( this.isTorndown === false ){
 
+
+		//  Kill the pending auto-pause timer so nothing
+		//  touches this Voice’s gain after it’s gone.
+
+		this.clearSustainTimeout()
+
+
+		//  Cancel any scheduled envelope and silence the gain.
+		//  After a full Beep.reset() every Voice’s gain
+		//  must read zero -- no dangling ramps.
+
+		if( this.gainNode ){
+
+			this.gainNode.gain.cancelScheduledValues( this.audioContext.currentTime )
+			this.gainNode.gain.setValueAtTime( 0, this.audioContext.currentTime )
+			this.gainNode.gain.value = 0
+			this.gainNode.disconnect()
+		}
 		if( this.oscillator ){
 			if( this.isPlaying ) this.oscillator.stop( 0 )// Stop oscillator after 0 seconds.
 			this.oscillator.disconnect()// Disconnect oscillator so it can be picked up by browser’s garbage collector.
